@@ -1,0 +1,19 @@
+{
+  "name": "day2-sui-gasless",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gasless stablecoin payments on Sui — sponsored transactions, plug-and-play gas station, and a payment app. SuiHub Lagos, Day 2.",
+  "scripts": {
+    "e2e": "node scripts/gasless-e2e.mjs"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.30.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"],
+    "overrides": {
+      "@mysten/sui": "1.45.2"
+    }
+  }
+}

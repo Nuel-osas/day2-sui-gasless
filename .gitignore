@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+move/build/
+*.log
+.env
+.env.local
+.DS_Store
+.vite/
+app/tsconfig.tsbuildinfo
+*.tsbuildinfo

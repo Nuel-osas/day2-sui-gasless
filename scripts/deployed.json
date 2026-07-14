@@ -1,0 +1,9 @@
+{
+  "network": "testnet",
+  "rpc": "https://sui-testnet-rpc.publicnode.com",
+  "packageId": "0x25c5d3b509841312696b353a9218d1992caccafd03ca6f198f9fd7dfd7011efd",
+  "faucet": "0xe6dda9812f7d7f84eadd0686690c2c8b9d56b2dea2af018dcd73efb5794b583b",
+  "coinType": "0x25c5d3b509841312696b353a9218d1992caccafd03ca6f198f9fd7dfd7011efd::fusd::FUSD",
+  "sponsorAddress": "0x9a5b0ad3a18964ab7c0dbf9ab4cdecfd6b3899423b47313ae6e78f4b801022a3",
+  "publishedDigest": "Dm3vzDzDRuJL5m9bbhya32kC6werdaC9AtBbQuTF6H8h"
+}
