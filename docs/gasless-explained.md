@@ -1,212 +1,279 @@
-# Gasless (Sponsored) Transactions on Sui — End to End
+# Gasless on Sui — Two Techniques, End to End
 
-A teaching reference for how **sponsored transactions** let a user who holds
-**zero SUI** still transact, because a **sponsor** pays the gas. Grounded in the
-Move + TypeScript in this repo and in real, verified **testnet** transactions.
+A teaching reference for the **two different ways to remove gas friction on Sui**.
+They are complementary, not competing:
+
+1. **Native gasless stablecoin transfers** — a *protocol-level* feature (live on
+   **mainnet** since 2026-05-20). Sending an allowlisted stablecoin peer-to-peer
+   costs **$0.00**, with **no sponsor and no second signature**. Built on a new
+   primitive called **Address Balances** (SIP-58).
+2. **Sponsored transactions** (the *gas station*) — an *app-level* pattern where a
+   **sponsor** pays the gas for the user. Works for **any transaction and any
+   token**, on any network.
+
+> The one-line mental model: **an allowlisted stablecoin, sent peer-to-peer → use
+> the native feature (free, nothing to run). Anything else you want to feel
+> gasless → sponsor it.** A real app often uses *both* — native for stablecoin
+> payments, a sponsor for its swaps / mints / app calls.
+
 Day 2 of the Sui stack (Day 1 = confidential transfers, Day 3 = tunnels).
 
 ---
-
-## 0. The one-paragraph mental model
-
-Every Sui transaction carries two things: the **intent** (what to do — "send 3
-FUSD to Ada") and the **gas payment** (a SUI coin that pays for execution).
-Normally both come from the same wallet, which is why a first-time user is told
-to *go buy SUI before they can move their stablecoin*. **Sponsored transactions
-split those two roles.** The **sender** owns and signs the intent; a separate
-**sponsor** owns the gas coin and signs to pay for it. One transaction, **two
-signatures**, and the sender never needs a single MIST of SUI.
-
-> **Gasless ≠ free.** Someone still pays — the **sponsor**. The user pays zero;
-> the cost moves to whoever runs the gas station. "Gasless" is a UX property, not
-> a physics one.
-
 ---
 
-## 1. What is whose — sender vs. sponsor
+# Technique 1 — Native gasless stablecoin transfers (Address Balances / SIP-58)
 
-| The SENDER (the user) | The SPONSOR (the gas station) |
+## 1.0 The one-paragraph mental model
+
+Sui normally holds every coin as an **object** — a `Coin<T>` with its own id and
+version (UTXO-style: you select, split, and merge coins, and every transfer
+*writes objects*). **Address Balances** add a second model: a canonical
+**per-address, per-type balance** — an account-style number keyed by
+`(address, CoinType)`. Moving an allowlisted stablecoin over this balance is such
+a **bounded, no-object-write** operation that the **protocol itself accepts it
+with `gas_price = 0` and no gas coin at all.** No sponsor pays; the network
+settles it. That is what "gasless stablecoin transfer" means on Sui — and it's
+why Sui became the first L1 to zero stablecoin gas at the protocol level (it moved
+~**$65B in its first five days**).
+
+> **Native gasless ≠ sponsored.** There is **no sponsor, no second signature, no
+> service to run.** The user signs one transaction with `gas = 0` and the protocol
+> settles it. This is a property of the chain, not of your app.
+
+## 1.1 The model shift — objects → an accumulator (account model)
+
+| `Coin<T>` object model (classic) | Address Balances (SIP-58) |
 |---|---|
-| Owns the **intent** (the `TransactionKind`) | Owns the **gas coin** (a `Coin<SUI>`) |
-| Signs the transaction as sender | Signs the transaction as gas owner |
-| Needs **zero SUI** | Needs SUI to pay gas |
-| Its address is `tx.sender` | Its address is `tx.gasOwner` |
-| Cannot be impersonated — the sponsor can't alter what it signed | Can **refuse** (censor) but cannot **steal** |
+| Each coin is an on-chain **object** (id + version + balance) | One **balance number** per `(address, T)` |
+| You **select / split / merge** coins; every move **writes objects** | Deposits **auto-merge**; nothing to manage |
+| Transaction building is **stateful** (must know coin versions) | Transaction building is **stateless** (no versions to look up) |
+| Parallelism limited by object contention | **Unlimited parallel** deposits + withdrawals |
 
-Both facts are **public on-chain**: anyone reading the transaction sees the
-sender *and* that the sponsor's coin paid. Gasless is about who *pays*, not about
-hiding anything (that's Day 1).
+An Address Balance is stored as a **dynamic field under a single root accumulator
+object at id `0xacc`**, keyed by `(SuiAddress, T)`. `T` only needs a **commutative
+merge/split** — which is exactly what money is.
+
+## 1.2 The accumulator mechanism — events, not object writes
+
+A native transfer does **not** mutate a coin object. It **emits an "accumulator
+event"**:
+
+- **Merge** = a deposit (add to the recipient's balance)
+- **Split** = a withdrawal (subtract from the sender's balance)
+
+At **checkpoint construction**, validators **aggregate** all the accumulator
+events and apply them via **settlement system-transactions** that atomically
+update the balances. Because the hot path emits events instead of versioning
+objects, there is **no object contention** on a balance update.
+
+### Why that makes it free *and* parallel — and safe from abuse
+
+- **Deposits** merge into an accumulator with **no locking**.
+- **Withdrawals** are *reserved before execution* via a new transaction input,
+  `CallArg::FundsWithdrawal` (reservation amount + currency type + fund owner).
+  The scheduler guarantees no underflow up front, so there are **no account-level
+  locks at execution time**. At runtime the reservation becomes a
+  `0x2::funds_accumulator::Withdrawal<T>` (with `split` / `join`); crucially, a
+  withdrawal is **"not withdrawn unless redeemed."**
+- Because the operation is **bounded, commutative, and writes no objects**, the
+  protocol can safely execute it with **`gas_price = 0` and an empty
+  `gas_payment`** — settlement is cheap and spam-limited (see guardrails, §1.5).
+
+## 1.3 The Move API (framework `0x2`)
+
+```move
+// Deposit a Balance into a recipient's funds accumulator (send).
+public fun send_funds<T>(balance: Balance<T>, recipient: address)
+
+// Redeem a reserved withdrawal into a usable Balance (coin:: variant returns Coin<T>).
+public fun redeem_funds<T>(w: Withdrawal<Balance<T>>): Balance<T>
+
+// Withdraw from an OBJECT-owned balance — needs &mut UID, so it is NOT parallel.
+public fun withdraw_funds_from_object<T>(obj: &mut UID, value: u64): Withdrawal<Balance<T>>
+```
+
+Helpers: `coin::into_balance` (Coin → Balance), `coin::send_funds` (send a Coin
+directly), and `withdrawal_split` / `withdrawal_join` on a `Withdrawal<T>`.
+
+## 1.4 TypeScript — a stateless, gasless send
+
+```ts
+// SEND an allowlisted stablecoin to an address balance
+const tx = new Transaction();
+tx.moveCall({
+  target: "0x2::balance::send_funds",
+  typeArguments: [USDC],
+  arguments: [tx.balance({ type: USDC, balance: 1_000_000n }), tx.pure.address(to)],
+});
+// gRPC/GraphQL transports auto-DETECT eligibility and set gas=0 during simulation.
+// On JSON-RPC you set it yourself:  tx.setGasPrice(0)  (+ empty gas payment)
+
+// WITHDRAW / redeem from your address balance back into a Coin
+const [coin] = tx.moveCall({
+  target: "0x2::coin::redeem_funds",
+  typeArguments: [USDC],
+  arguments: [tx.withdrawal({ amount: 1_000_000, type: USDC })],
+});
+```
+
+Transaction building is **fully stateless** — `tx.withdrawal({ amount, type })`
+needs **no coin object versions**, so a client can build a valid transfer offline
+without querying chain state. RPC now separates the two models:
+`getBalance` returns **`coinBalance`** vs **`addressBalance`** vs **`totalBalance`**
+(the `fundsInAddressBalance` field).
+
+## 1.5 Eligibility & guardrails (all protocol config)
+
+Native gasless is **narrow by design** — that narrowness is the security model.
+
+- **Allowlist** — `get_gasless_allowed_token_types`. Only these qualify:
+  **USDC, USDsui, SuiUSDe, USDY, FDUSD, AUSD, USDB**. Your own token **cannot**
+  opt in (it's governance-gated, mainnet-only).
+- **Feature flag** — `enable_address_balance_gas_payments`.
+- **Transaction shape** — the PTB must be **only** allowlisted balance/coin
+  accumulator ops on an allowlisted type, with **no object writes**.
+- **Minimum transfer** — **0.01**; smaller transfers are rejected.
+- **Congestion** — when the network is busy, **fee-paying transactions are
+  prioritized** over gasless ones.
+- **Replay** — stateless transactions are bounded by a **two-epoch validity
+  window + a nonce** (`TransactionExpiration::ValidDuring`), using validator
+  digests from the current/prior epoch.
+
+**Who pays?** No one attaches gas; the **protocol absorbs** the bounded settlement
+cost. The allowlist + minimum + no-object-writes + congestion deprioritization are
+precisely what stop it from becoming a spam or free-compute vector.
+
+## 1.6 The proof — a real mainnet gasless transfer
+
+You **cannot** reproduce true `gas = 0` with a custom token — the allowlist is
+mainnet-only and governance-gated. (The Address Balances API itself —
+`send_funds` / `redeem_funds` — is usable on testnet, but the protocol only grants
+`gas = 0` to **allowlisted** coins.) So the honest proof is a real mainnet tx:
+
+```
+digest:  WT4gyuLPvgeLDXBDZ79bQiQZMsjarFx8T5RXy7LFkko   (suiscan.xyz/mainnet/tx/…)
+gas price:      0        gas budget: 0        gas coins attached: 0
+computation:    3927528 MIST     storage rebate: 3927528 MIST
+NET GAS PAID:   0 MIST   ← $0.00
+calls:   0x2::coin::into_balance · 0x2::balance::send_funds · 0x2::coin::send_funds
+type:    0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC
+moved:   ~1,015 USDC   sender → recipient      status: success
+```
+
+Reproduce it: **`node scripts/mainnet-gasless-proof.mjs`** (reads the tx off a
+mainnet fullnode and prints the breakdown). No sponsor, no gas coin — the protocol
+accepted a `gas = 0` transfer because **USDC is on the gasless allowlist.**
 
 ---
+---
 
-## 2. The mechanism — the exact handshake
+# Technique 2 — Sponsored transactions (the gas station)
 
-A sponsored transaction is built in **two halves that must sign the *same
-bytes***. The order matters: the sponsor builds the final transaction (because
-gas selection changes the bytes), then the sender signs what the sponsor built.
+When the native feature doesn't apply — **your own token**, a **swap**, an **NFT
+mint**, **any app call** — you make it gasless the app-level way: a **sponsor**
+pays the gas so the user (holding **0 SUI**) only signs.
+
+## 2.1 The mental model — split the intent from the gas
+
+Every Sui transaction carries an **intent** (what to do) and a **gas payment** (a
+SUI coin). Normally both come from one wallet. Sponsorship **splits the roles**:
+the **sender** owns + signs the intent; a separate **sponsor** owns the gas coin
+and signs to pay. One transaction, **two signatures**, sender needs zero SUI.
+
+| The SENDER (user) | The SPONSOR (gas station) |
+|---|---|
+| Owns the **intent** (`TransactionKind`) | Owns the **gas coin** (`Coin<SUI>`) |
+| Signs as sender (`tx.sender`) | Signs as gas owner (`tx.gasOwner`) |
+| Needs **zero SUI** | Needs SUI to pay gas |
+| Cannot be impersonated | Can **refuse** (censor) but cannot **steal** |
+
+> **Sponsored ≠ free.** Someone pays — the sponsor. "Gasless" here is a UX
+> property. Both parties are **public on-chain**.
+
+## 2.2 The mechanism — the two-signature handshake
+
+The sender and sponsor **must sign the *same bytes*.** The sponsor builds the
+final transaction (gas selection changes the bytes), then the sender signs the
+sponsor's output.
 
 ```
  CLIENT (user)                         GAS STATION (sponsor)
- ─────────────                         ─────────────────────
- build intent (a Transaction)
+ build intent (Transaction)
  setSender(user)
  build({ onlyTransactionKind: true })
-        │  txKindBytes  (NO gas yet)
-        │ ───────────────────────────►  Transaction.fromKind(txKindBytes)
+        │  txKindBytes (NO gas)  ─────►  Transaction.fromKind(txKindBytes)
         │                               setSender(user)
         │                               setGasOwner(sponsor)
         │                               setGasPayment([sponsorCoin])
         │                               setGasBudget(...)
-        │                               txBytes = build()          ← final bytes
-        │                               sponsorSig = sign(txBytes)
-        │  ◄─────────────────────────── { txBytes, sponsorSig }
+        │                               txBytes = build()      ← final bytes
+        │  ◄── { txBytes, sponsorSig } ─ sponsorSig = sign(txBytes)
  senderSig = sign(txBytes)   ← the SAME bytes
-        │
         └── executeTransactionBlock({ transactionBlock: txBytes,
                                       signature: [senderSig, sponsorSig] })
 ```
 
-### 2.1 Client side — serialize the *intent only*
-
-The client builds a normal `Transaction` and serializes it **without gas** using
-`onlyTransactionKind: true`. That's the whole trick on the client: describe
-*what* to do, attach *nothing* about paying for it.
+**Client — serialize the intent only** (`packages/gas-station/src/client.ts`):
 
 ```ts
-// packages/gas-station/src/client.ts (shape)
 tx.setSender(sender);
 const kind = await tx.build({ client, onlyTransactionKind: true }); // no gas
 const { txBytes, sponsorSignature } = await sponsor({ txKindBytes: toB64(kind), sender });
-const { signature: senderSignature } = await signAsSender(fromB64(txBytes));
+const { signature: senderSignature } = await signAsSender(fromB64(txBytes)); // SAME bytes
 return client.executeTransactionBlock({
   transactionBlock: txBytes,
-  signature: [senderSignature, sponsorSignature], // sender + sponsor
+  signature: [senderSignature, sponsorSignature],
 });
 ```
 
-### 2.2 Sponsor side — attach gas, sign, return
-
-The gas station rehydrates the intent with `Transaction.fromKind`, sets the
-sender, points the gas at **its own** coin, builds, and signs:
+**Sponsor — attach gas, sign, return** (`packages/gas-station/src/station.ts`):
 
 ```ts
-// packages/gas-station/src/station.ts (core)
 const tx = Transaction.fromKind(kindBytes);
 tx.setSender(req.sender);
 tx.setGasOwner(this.sponsorAddress);
 tx.setGasPayment([{ objectId, version, digest }]); // a sponsor-owned SUI coin
 tx.setGasBudget(this.gasBudget);
-
 const txBytes = await tx.build({ client: this.client });
-const { signature } = await this.sponsor.signTransaction(txBytes);
+const { signature } = await this.signer.signTransaction(txBytes);
 return { txBytes: toB64(txBytes), sponsorSignature: signature };
 ```
 
-> **The golden rule:** the **sender and sponsor sign identical bytes.** That's
-> why the sponsor builds *first* and the sender signs the sponsor's output. If
-> the sender signs bytes built before gas was attached, the signatures cover
-> different messages and execution fails. (See edge case #3.)
+> **Golden rule:** sender and sponsor **sign identical bytes**. The sponsor builds
+> first; the sender signs the sponsor's output. Sign pre-gas bytes and it fails.
 
----
+## 2.3 Gas station internals
 
-## 3. Why *Sui* makes this clean
+- **Reserve a gas coin** — list the sponsor's SUI coins, pick the largest that
+  covers the budget **and isn't already reserved** by an in-flight request.
+- **Equivocation (the #1 footgun)** — if two concurrent sponsorships grab the
+  *same* coin and both submit, the coin is **locked as equivocated until end of
+  epoch** (~24h). Never hand one coin to two in-flight txs; the `locked` set does
+  this in-process, Redis/DB across processes.
+- **Coin pool** — one coin = one tx at a time. To sponsor *N* in parallel, split
+  the sponsor's balance into *N* coins.
+- **Gas budget** — default `20_000_000` MIST (0.02 SUI); unused gas is refunded.
 
-- **First-class in the protocol.** Sui's transaction format has a distinct
-  **gas owner** separate from the **sender**; sponsorship isn't a bolt-on, it's
-  native. Two signers, one `TransactionData`.
-- **`onlyTransactionKind`.** The SDK can serialize the intent *without* gas, so
-  the client never has to know which coin will pay — the sponsor decides that.
-- **Object-scoped signatures.** Because Sui signs over concrete object
-  references (the exact gas coin version), the sponsor fully controls and bounds
-  what its coin is used for — it can't be tricked into paying for a different
-  transaction than it signed.
+## 2.4 Policy — the seam that stops a drained wallet
 
----
-
-## 4. The gas station internals (`GasStation`)
-
-The station is deliberately tiny and **app-agnostic**. Its whole job:
-
-```
-in:   { txKindBytes, sender }
-out:  { txBytes, sponsorSignature }
-```
-
-### 4.1 Reserving a gas coin — and why it's the hard part
-
-`reserveGasCoin()` lists the sponsor's SUI coins and picks the largest one that
-covers the budget **and isn't already reserved** by an in-flight request:
+A **naive open sponsor pays for anyone's transactions.** `GasStation` takes a
+`SponsorPolicy: (req) => null | reason`:
 
 ```ts
-const free = data
-  .filter((c) => !this.locked.has(c.coinObjectId)) // not reserved
-  .filter((c) => BigInt(c.balance) >= this.gasBudget)
-  .sort((a, b) => (BigInt(b.balance) > BigInt(a.balance) ? 1 : -1));
+policy: allOf(
+  onlyPackages([FUSD_PKG]),   // only sponsor calls into MY package
+  rateLimit(10, 60_000),      // per-sender cap
+)
 ```
 
-**Why the lock matters (the #1 production footgun): object equivocation.** If two
-concurrent sponsorships both grab the *same* gas coin and both get signed and
-submitted, they reference the same object version. The validators accept one and
-the coin is now **locked as equivocated until the end of the epoch** — the
-sponsor's coin is frozen for up to ~24h. So a gas station must **never hand the
-same coin to two in-flight transactions.** The in-memory `locked` set does this
-for a single process.
+Typical guards: **allowlist target package**, **per-sender rate limit**, **per-tx
+gas cap**, **daily budget cap**. Note a pure coin transfer carries **no MoveCall**,
+so this repo's FUSD exposes a `fusd::pay` MoveCall — that's what lets `onlyPackages`
+strictly authorize a stablecoin send.
 
-### 4.2 Coin pool — throughput
+## 2.5 The verified demo (`scripts/gasless-e2e.mjs`, `app/`)
 
-One coin = one transaction at a time (per the lock above). To sponsor *N*
-transactions in parallel, the sponsor needs *N* separate SUI coins. In
-production you **split the sponsor's balance into a pool** of many coins (e.g.
-100 × 0.1 SUI) and hand out a different one per request. A multi-process gas
-station replaces the in-memory `Set` with a shared reservation (Redis, a DB row
-lock, or Mysten's reference gas-station service).
-
-### 4.3 Gas budget
-
-`gasBudget` (default `20_000_000` MIST = 0.02 SUI) is the ceiling the sponsor is
-willing to spend on one transaction. Unused gas is refunded to the sponsor;
-setting it too low aborts execution (edge case #1). A real gas coin must hold
-*at least* the budget.
-
----
-
-## 5. End-to-end lifecycle (from `scripts/gasless-e2e.mjs`)
-
-The verified script proves the whole point: a fresh user with **0 SUI** ends up
-having sent a stablecoin.
-
-### Step 0 — A stablecoin exists (`move/sources/fusd.move`)
-
-FUSD is a plain `Coin<FUSD>` (6 decimals). The only special bit is a **shared
-`Faucet`** wrapping the `TreasuryCap` so anyone can `mint`. Nothing in the coin
-knows about gas — **gaslessness lives in how the transfer is sponsored, not in
-the asset.**
-
-```move
-public entry fun mint(faucet: &mut Faucet, amount: u64, recipient: address, ctx: &mut TxContext) {
-    let c = coin::mint(&mut faucet.cap, amount, ctx);
-    transfer::public_transfer(c, recipient);
-}
-```
-
-### Step 1 — User gets stablecoins, still holds 0 SUI
-
-The sponsor mints FUSD to the user (sponsor pays that gas too). The user now has
-FUSD and **zero SUI**.
-
-### Step 2 — The gasless transfer
-
-The user builds a split-and-transfer intent over their FUSD, and `sponsorAndSend`
-does the handshake from §2. The user signs; the sponsor pays.
-
-```ts
-const tx = new Transaction();
-const [sent] = tx.splitCoins(tx.object(userCoin), [tx.pure.u64(3n * ONE_FUSD)]);
-tx.transferObjects([sent], tx.pure.address(recipient));
-await sponsorAndSend(sponsor, tx, user); // user pays 0 gas
-```
-
-### Step 3 — Verify
+A fresh user with **0 SUI** claims FUSD and sends it, sponsor paying gas:
 
 ```
 user SUI:       0.0000  (still ZERO — never paid gas)
@@ -214,148 +281,105 @@ recipient FUSD: 3.00
 gas paid by sponsor: 0.0023 SUI
 ```
 
-**Real testnet run:**
-- gasless transfer: [`GARm8aaLyURVbQvFgYEuRvE5WyAnwgJhBqzxUKNN5Nq6`](https://suiscan.xyz/testnet/tx/GARm8aaLyURVbQvFgYEuRvE5WyAnwgJhBqzxUKNN5Nq6)
-  — user held 0 SUI, sponsor paid 0.0023 SUI.
+Real testnet run — gasless transfer via `fusd::pay`:
+[`BW7k9MGfLfZdaCYKgiY7C6NGufXaZiXpxr1Tuva4BxvC`](https://suiscan.xyz/testnet/tx/BW7k9MGfLfZdaCYKgiY7C6NGufXaZiXpxr1Tuva4BxvC)
+— user held 0 SUI, sponsor paid 0.0023 SUI. The app's live `/api/sponsor` endpoint
+is verified the same way (`scripts/verify-app-endpoint.mjs`).
 
-```
-Full gasless send, at a glance:
+## 2.6 Composability — sponsor anything
 
-  USER (0 SUI)                          SPONSOR (has SUI)
-  build intent ─ sign as sender ──┐
-                                  │  (sponsor attaches gas + signs)
-                                  └──► executeTransactionBlock([senderSig, sponsorSig])
-                                       user pays 0 · sponsor pays gas · recipient credited
-```
-
----
-
-## 6. Security & abuse — the part that bites in production
-
-A **naive open sponsor pays for *any* transaction anyone sends it.** That's a
-drained wallet waiting to happen. The trust model and defenses:
-
-### 6.1 What the sponsor *can* and *cannot* do
-
-- ✅ **Refuse / censor** — decline to sponsor (that's the policy hook below).
-- ✅ **Grief** — sign nothing, or accept the intent and then *not submit* it
-  after the user signed. Annoying, not theft. (Mitigate: client submits, or a
-  short timeout + retry.)
-- ❌ **Steal / alter the intent** — impossible. The sender's signature covers the
-  *exact* bytes, including the intent. The sponsor can only pay for what the user
-  signed, or pay for nothing.
-- ⚠️ **Equivocate its own gas coin** — a *self*-inflicted risk (§4.1), fixed by
-  the reservation lock.
-
-### 6.2 Policy — the single seam for defense
-
-`GasStation` takes an optional `SponsorPolicy`: `(req) => null | reason`. Return
-`null` to allow, a string to reject. This is where every real-world guard goes:
-
-```ts
-const policy: SponsorPolicy = ({ sender, tx }) => {
-  // allowlist: only sponsor calls into MY package
-  const calls = tx.getData().commands.filter((c) => c.MoveCall);
-  if (!calls.every((c) => c.MoveCall.package === MY_PACKAGE)) return "not my package";
-  if (await rateLimiter.exceeded(sender)) return "rate limit";     // per-sender cap
-  if (estimatedGas(tx) > MAX_TX_GAS) return "over per-tx cap";     // per-tx cap
-  return null; // ✅ sponsor it
-};
-```
-
-Typical policies: **allowlist target package/function**, **per-sender rate
-limit**, **per-tx gas cap**, **daily budget cap**, **KYC/session gating**. Without
-one, assume your sponsor gets drained.
-
----
-
-## 7. Composability — why it's built "plug and play"
-
-The station's input is **just a `TransactionKind`** — it never inspects the
-asset or the app beyond policy. So **anything** can be made gasless by routing
-its intent through the same station:
+The station's input is **just a `TransactionKind`**, so anything can be made
+gasless by routing its intent through it:
 
 | Sponsor this intent… | …and you get |
 |---|---|
-| A stablecoin transfer (this repo) | Gasless payments |
-| A **Day-1 confidential transfer PTB** | **Gasless *and* private** — hidden amount, zero SUI |
+| A **Day-1 confidential transfer** | Gasless **and** private (hidden amount, zero SUI) |
 | An NFT mint / a DEX swap | Gasless mint / gasless trade |
 | A **Day-3 tunnel settlement** | Gasless channel close |
-| Any Move call your app makes | Gasless onboarding for that app |
-
-Same `GasStation`, same two-signature handshake. The gas station is asset- and
-app-agnostic infrastructure — drop it into any Sui dApp.
+| **Your own token** transfer | Gasless payments for a non-allowlisted coin |
 
 ---
-
-## 8. Why this is the real unlock (Africa / Nigeria framing)
-
-The single biggest onboarding killer in Lagos, Nairobi, or anywhere: to send $5
-of stablecoins, a first-time user is told to *first buy a different token (SUI)
-for gas*. That step ends more sessions than any UI problem. Sponsored
-transactions delete it — the user holds only the stablecoin they care about and
-sends it. "No SUI needed" isn't a nice-to-have here; it's the whole product.
-
 ---
 
-## 9. Edge cases & gotchas (the part students trip on)
+# When to use which
 
-| # | Case | What happens / rule |
+| | **Native (Address Balances)** | **Sponsored (gas station)** |
 |---|---|---|
-| 1 | **Gas budget too low** | Execution aborts (`InsufficientGas`). Raise `gasBudget`; unused gas is refunded, so a generous budget is safe. |
-| 2 | **Sponsor out of funds / no coin covers budget** | `reserveGasCoin` throws "gas station out of funds." Top up, or split the sponsor's balance into more/larger coins. |
-| 3 | **Sender signs stale bytes** | ⚠️ Most common bug. The sender **must sign the bytes the *sponsor* built** (post-gas), not the pre-gas kind. Sign the sponsor's `txBytes`, or both signatures cover different messages and it fails. |
-| 4 | **Gas coin locked by a concurrent sponsorship** | Two in-flight txs sharing one coin → equivocation → coin frozen till epoch end (~24h). The `locked` set prevents it in-process; use a shared lock across processes. |
-| 5 | **Sponsor == sender (same address)** | Allowed but degenerate — it's just a normal self-paid tx. The e2e's *mint* step does exactly this (sponsor is also sender). Gasless only matters when they differ. |
-| 6 | **Intent references objects the sender doesn't own** | Passes building, **fails at execution** (the sender can't touch objects it doesn't own). Policy/UX should catch this early. |
-| 7 | **Sponsor griefs (never submits)** | The user signed but nothing lands. Not theft — no state changed. Have the *client* submit, or time out and retry. |
-| 8 | **Testnet public fullnode 404s** | ⚠️ `https://fullnode.testnet.sui.io` returns **404 for JSON-RPC** (SDK `getFullnodeUrl('testnet')` hits it). We pin a working RPC: **`https://sui-testnet-rpc.publicnode.com`** (see `scripts/deployed.json`). |
-| 9 | **Devnet/testnet reset** | Object IDs stop resolving after a network wipe. Re-publish `move/`, repaste IDs into `deployed.json`. Testnet resets far less often than devnet — prefer testnet for a demo. |
-| 10 | **Object version drift on the gas coin** | `setGasPayment` needs the coin's current `{objectId, version, digest}`. If the sponsor used that coin elsewhere between read and sign, the version is stale → rebuild. The per-request read + lock keeps this fresh. |
-| 11 | **Two signatures, order** | `signature: [senderSig, sponsorSig]` — Sui matches signatures to the sender and gas owner by their public keys, but keep the convention sender-first for clarity. |
+| Who allows free | The **protocol** | An **app-run sponsor** pays |
+| Signatures | **Sender only** | **Sender + sponsor** |
+| Works for | **Only allowlisted stablecoins**, P2P transfer | **Any tx, any token** (swaps, mints, app calls, your coin) |
+| Cost | Absorbed by the protocol (bounded) | The sponsor's SUI |
+| Infra to run | **None** | A gas-station service + funded sponsor + policy |
+| Network | **Mainnet** (allowlist) | Any network |
+| Underlying tech | Accumulator / `send_funds` / SIP-58 | Two-signature `TransactionData` (gas owner ≠ sender) |
+
+**Rule of thumb:** sending an **allowlisted stablecoin peer-to-peer** → native
+(free, nothing to run). **Anything else** you want to feel gasless → **sponsor
+it**. They **compose**: a payments app can settle stablecoin transfers natively
+and sponsor its own non-transfer actions.
+
+> **Why this matters here (Africa / Nigeria):** the biggest onboarding killer is
+> "first, go buy SUI for gas." Native gasless deletes it for stablecoins with
+> *nothing to run*; sponsorship deletes it for everything else. Either way, "no
+> SUI needed" stops being a nice-to-have and becomes the product.
 
 ---
 
-## 10. Security model — one-screen summary
+# Edge cases & gotchas
 
-- **Gasless, not trustless-free.** The sponsor pays; protect it with **policy**.
-- **Sponsor can censor, never steal.** The sender's signature binds the intent;
-  the sponsor only chooses to pay or not.
-- **Equivocation is self-inflicted.** Never reuse a gas coin across concurrent
-  sponsorships — lock it, or run a coin pool.
-- **Both parties are public.** Sender and sponsor are on-chain. Want the *amount*
-  hidden too? Compose with Day 1 (confidential + gasless).
-- **The intent is the contract.** Everything downstream (policy, gas, signing)
-  is arranged around bytes the sender authored and signed.
+| # | Technique | Case | Rule |
+|---|---|---|---|
+| 1 | Native | **Non-allowlisted token** | `gas = 0` is refused. Only USDC/USDsui/SuiUSDe/USDY/FDUSD/AUSD/USDB qualify; your own coin never will. Use a sponsor instead. |
+| 2 | Native | **Transfer below 0.01** | Rejected by the minimum-transfer rule. |
+| 3 | Native | **PTB does more than a balance/coin op** | Any object write / non-allowlisted call disqualifies it from gasless — it needs gas. Keep gasless PTBs to pure `send_funds`/`redeem_funds`. |
+| 4 | Native | **JSON-RPC transport** | Only gRPC/GraphQL auto-detect eligibility. On JSON-RPC you must set `gasPrice(0)` yourself, or it's treated as a normal (paid) tx. |
+| 5 | Native | **Network congested** | Gasless is **deprioritized** behind fee-payers; a free transfer may wait. Paying a fee jumps the queue. |
+| 6 | Native | **Reproducing on testnet** | The API works, but `gas = 0` isn't granted to custom coins — verify the concept with the **real mainnet tx** (`mainnet-gasless-proof.mjs`), not a testnet mint. |
+| 7 | Sponsor | **Sender signs stale bytes** | ⚠️ Most common bug. Sign the bytes the **sponsor** built (post-gas), not the pre-gas kind, or the two signatures cover different messages. |
+| 8 | Sponsor | **Gas coin equivocated** | Two in-flight txs sharing one coin → coin frozen till epoch end (~24h). Lock reserved coins; pool in prod. |
+| 9 | Sponsor | **Open sponsor with no policy** | Drained wallet. Add `onlyPackages` + `rateLimit` + a per-tx cap. |
+| 10 | Sponsor | **Sponsor griefs (never submits)** | User signed, nothing lands — annoying, not theft. Have the client submit / time out + retry. |
+| 11 | Both | **Testnet public fullnode 404s** | `https://fullnode.testnet.sui.io` returns **404 for JSON-RPC**. We pin `https://sui-testnet-rpc.publicnode.com`; mainnet reads use `https://sui-rpc.publicnode.com`. |
 
 ---
 
-## 11. Cheat-sheet
+# Security model — one screen
 
-**The two-signature rule:** sponsor builds the final `txBytes` → sender signs
-*those* bytes → submit `signature: [senderSig, sponsorSig]`.
+**Native gasless**
+- **No sponsor, no second signature** — the protocol settles it.
+- **Narrowness *is* the security**: allowlist + min 0.01 + no object writes +
+  congestion deprioritization keep "free" from being a spam / free-compute vector.
+- **Not anonymous** — sender, recipient, and amount are public (compose with Day 1
+  for privacy).
 
-**Client (intent, no gas):**
-`tx.setSender(u)` · `tx.build({ onlyTransactionKind: true })`
+**Sponsored**
+- **Gasless, not trustless-free** — the sponsor pays; protect it with **policy**.
+- **Sponsor can censor, never steal** — the sender's signature binds the intent.
+- **Equivocation is self-inflicted** — never reuse a gas coin concurrently.
+- **Both parties public** — sender and sponsor are on-chain.
 
-**Sponsor (attach gas, sign):**
-`Transaction.fromKind(kind)` · `setSender` · `setGasOwner` · `setGasPayment([coin])`
-· `setGasBudget` · `build()` · `sponsor.signTransaction(bytes)`
+---
 
-**Submit:**
-`client.executeTransactionBlock({ transactionBlock: txBytes, signature: [senderSig, sponsorSig] })`
+# Cheat-sheet
 
-**Policy hook:** `(req) => null | "reason"` — allowlist · rate-limit · per-tx cap · daily cap.
+**Native (allowlisted stablecoin, P2P):**
+`0x2::balance::send_funds<T>(balance, recipient)` · `0x2::coin::redeem_funds<T>(withdrawal)` ·
+`tx.withdrawal({ amount, type })` · **`gas_price = 0`, no gas coin** · gRPC/GraphQL auto-detect ·
+allowlist `get_gasless_allowed_token_types` · flag `enable_address_balance_gas_payments` ·
+min 0.01 · root accumulator `0xacc` · proof `WT4gyuLPvgeLDXBDZ79bQiQZMsjarFx8T5RXy7LFkko`.
 
-**Anti-drain checklist:** policy on ✔ · gas coin pool ✔ · per-coin reservation lock ✔ · budget cap ✔.
+**Sponsored (anything else):**
+sponsor builds final `txBytes` → sender signs *those* bytes → `signature: [senderSig, sponsorSig]`.
+Client: `tx.build({ onlyTransactionKind: true })`. Sponsor: `Transaction.fromKind` · `setGasOwner` ·
+`setGasPayment([coin])` · `setGasBudget` · `signTransaction`. Policy: `onlyPackages` · `rateLimit` ·
+per-tx cap. Anti-drain: policy ✔ · coin pool ✔ · reservation lock ✔ · budget cap ✔.
 
-**Deployed (testnet):**
+**Deployed (Technique-2 demo, testnet):**
 - RPC: `https://sui-testnet-rpc.publicnode.com`
-- FUSD package: `0xece91a946edbf64a18fc0c7c5abdd1aaab5cba9b2337ef0ec13457de6df28102`
-- FUSD faucet (shared): `0xe14ea541e30910a297d6c3d3df73afdd2afb6a424717d05d8706c4ee293ea667`
-- coinType: `0xece91a946edbf64a18fc0c7c5abdd1aaab5cba9b2337ef0ec13457de6df28102::fusd::FUSD`
+- FUSD package: `0x25c5d3b509841312696b353a9218d1992caccafd03ca6f198f9fd7dfd7011efd`
+- FUSD faucet (shared): `0xe6dda9812f7d7f84eadd0686690c2c8b9d56b2dea2af018dcd73efb5794b583b`
+- coinType: `0x25c5d3b509841312696b353a9218d1992caccafd03ca6f198f9fd7dfd7011efd::fusd::FUSD`
 - sponsor: `0x9a5b0ad3a18964ab7c0dbf9ab4cdecfd6b3899423b47313ae6e78f4b801022a3`
-- verified gasless tx: `GARm8aaLyURVbQvFgYEuRvE5WyAnwgJhBqzxUKNN5Nq6`
+- verified sponsored tx: `BW7k9MGfLfZdaCYKgiY7C6NGufXaZiXpxr1Tuva4BxvC`
 
-**Key limits:** default budget `20_000_000` MIST (0.02 SUI) · one gas coin per
-in-flight tx · sender + sponsor sign identical bytes.
+**Native proof (mainnet):** `node scripts/mainnet-gasless-proof.mjs` — USDC moved for **0 MIST** gas.

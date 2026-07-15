@@ -1,11 +1,73 @@
-# Plug-and-Play Gasless Architecture
+# Gasless on Sui — Two Architectures
 
-How to drop sponsored (gasless) transactions into **any** Sui app — and why the
-same box composes with Day 1 (confidential) and Day 3 (tunnels).
+There are **two different ways** to make Sui feel gasless. They are complementary,
+not competing — a real payments app uses both.
+
+| | **Technique 1 — Native (Address Balances)** | **Technique 2 — Sponsored (gas station)** |
+|---|---|---|
+| Who makes it free | The **protocol** | An **app-run sponsor** |
+| Scope | **Only allowlisted stablecoins**, P2P transfer | **Any** tx — swaps, mints, your own token, app calls |
+| Signatures | Just the sender | Sender **+** sponsor |
+| Cost | Absorbed by the protocol | The sponsor's SUI |
+| You run | Nothing | The sponsor service |
+| Where | Mainnet | Any network |
+
+**Rule of thumb:** sending an allowlisted stablecoin peer-to-peer → *native*.
+Anything else you want to feel gasless → *sponsor it*.
 
 ---
 
-## The one idea
+## Technique 1 — Native gasless (Address Balances / SIP-58)
+
+Live on Sui **mainnet since 2026-05-20** — the first L1 to zero stablecoin gas at
+the protocol level (~$65B moved in five days). It is **not** a sponsor.
+
+**The model shift.** Normally every coin is a `Coin<T>` **object** (UTXO-style:
+select/split/merge; every transfer writes objects). **Address Balances** add a
+canonical per-`(address, T)` balance, stored under a single root accumulator object
+at `0xacc`. `T` needs only commutative merge/split.
+
+**The accumulator.** A transfer **emits an accumulator event** (Merge=deposit,
+Split=withdraw) instead of writing objects. At checkpoint construction, validators
+aggregate the events and apply them via **settlement system-transactions**.
+Deposits merge lock-free; withdrawals are reserved before execution via
+`CallArg::FundsWithdrawal` so underflow can't happen → **no account-level locks**.
+Because the op is bounded, no-object-write, and commutative, the protocol accepts
+it at `gas_price = 0`.
+
+**The API** (framework `0x2`):
+
+```move
+public fun send_funds<T>(balance: Balance<T>, recipient: address)
+public fun redeem_funds<T>(w: Withdrawal<Balance<T>>): Balance<T>   // + coin:: variants
+```
+
+```ts
+tx.moveCall({ target: "0x2::balance::send_funds", typeArguments: [USDC],
+  arguments: [tx.balance({ type: USDC, balance: 5_000_000n }), tx.pure.address(to)] });
+// gas left empty; gRPC/GraphQL auto-detect and set gas = 0. Tx building is STATELESS.
+```
+
+**Why "free" isn't abusable.** An **allowlist** (`get_gasless_allowed_token_types`)
+— USDC, USDsui, SuiUSDe, USDY, FDUSD, AUSD, USDB — plus: PTB must be *only*
+allowlisted balance/coin ops, **no object writes**, min transfer `0.01`, feature
+flag `enable_address_balance_gas_payments`, and fee-payers are prioritized under
+congestion. Your own token **cannot** opt in (governance-gated).
+
+**Proof (real mainnet tx).** `WT4gyuLPvgeLDXBDZ79bQiQZMsjarFx8T5RXy7LFkko` — moved
+~1,015 USDC, gas price 0, zero gas coins, computation fully rebated → **net gas 0
+MIST**. Reproduce: `node scripts/mainnet-gasless-proof.mjs`. (You can't reproduce
+true gas=0 with a custom token — the allowlist is mainnet-only.)
+
+---
+
+## Technique 2 — Sponsored transactions (the plug-and-play gas station)
+
+For everything native gasless doesn't cover — swaps, mints, your own token, any app
+call — an app-run sponsor pays the gas. This is the reusable piece in this repo
+(`packages/gas-station`), and it composes with Day 1 (confidential) and Day 3 (tunnels).
+
+### The one idea
 
 On Sui, a transaction carries two separable things:
 

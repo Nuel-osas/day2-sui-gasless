@@ -1,11 +1,25 @@
 # Gasless Stablecoins on Sui — Day 2
 
-Send a stablecoin holding **zero SUI**. A sponsor pays the gas; the user only
-signs. Built on Sui's native **sponsored transactions** — no relayer hacks.
+There are **two different ways** to make Sui feel gasless. This repo teaches and
+proves **both** — they're complementary, not competing.
 
-**Real, not a mockup:** a freshly generated wallet with 0 SUI mints and sends a
-test stablecoin on **testnet**, and the sponsor pays the fee. Verified two ways —
-a self-contained script and the app's live endpoint.
+| | **Native (Address Balances)** | **Sponsored (gas station)** |
+|---|---|---|
+| Who makes it free | The **protocol** | An **app-run sponsor** |
+| Scope | Only **allowlisted stablecoins**, P2P transfer | **Any** tx — swaps, mints, your own token, app calls |
+| Signatures | Just the sender | Sender **+** sponsor |
+| You run | Nothing | The sponsor service |
+
+**Rule of thumb:** an allowlisted stablecoin peer-to-peer → *native, free, nothing
+to run*. Anything else you want gasless → *sponsor it*. See `ARCHITECTURE.md` and
+`docs/gasless-explained.md`.
+
+**Proven both ways, for real:**
+- **Native** — a real **mainnet** USDC transfer moved ~1,015 USDC for **$0.00 gas**
+  (`node scripts/mainnet-gasless-proof.mjs`).
+- **Sponsored** — a freshly generated wallet holding **0 SUI** sends our FUSD test
+  token on testnet while a sponsor pays; verified by a script *and* the app's live
+  endpoint.
 
 ## What's here
 
@@ -14,9 +28,14 @@ a self-contained script and the app's live endpoint.
 | `packages/gas-station/` | **`@gasless/station`** — the plug-and-play piece: client SDK (`sponsorAndSend`), gas-station server (`GasStation`, `createSponsorHandler`), composable policies (`onlyPackages`, `rateLimit`). |
 | `app/` | **SendFUSD** — a mobile-friendly React + dApp Kit payment app. Connect → claim FUSD → send, all gasless. Ships a Vite dev-server sponsor endpoint. |
 | `move/` | **FUSD** — a test stablecoin (`fusd`) with an open faucet + a `pay` MoveCall so the station can strictly allowlist it. |
-| `scripts/` | `gasless-e2e.mjs` (self-contained proof) and `verify-app-endpoint.mjs` (drives the app's live `/api/sponsor`). |
-| `docs/gasless-explained.md` | Teaching reference — sponsored-tx mechanics end to end. |
-| `ARCHITECTURE.md` | The plug-and-play design + how it composes with Day 1 (confidential) and Day 3 (tunnels). |
+| `scripts/` | `mainnet-gasless-proof.mjs` (walks a real **native** mainnet gasless USDC tx), `gasless-e2e.mjs` (self-contained sponsored proof), `verify-app-endpoint.mjs` (drives the app's live `/api/sponsor`). |
+| `docs/gasless-explained.md` | Teaching reference — **both** techniques end to end (native Address Balances + sponsored). |
+| `ARCHITECTURE.md` | Both architectures + when to use which + how sponsoring composes with Day 1/Day 3. |
+
+> **Note on the demo:** the runnable app demonstrates **sponsored** transactions
+> (technique 2), because native gasless (technique 1) only works for allowlisted
+> stablecoins on mainnet — you can't grant a custom testnet coin gas=0. The native
+> feature is proven instead by a real mainnet transaction (`mainnet-gasless-proof.mjs`).
 
 ## The idea in one line
 
