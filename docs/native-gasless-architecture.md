@@ -123,6 +123,36 @@ policy engine**. Your "architecture" for the transfer is entirely in the client.
 (You may still run a backend for *other* reasons — indexing, a sponsor for other
 actions — but not for the gasless transfer.)
 
+## Composability — staying gasless across a whole flow
+
+**The hard wall:** eligibility requires the PTB to be *only* allowlisted
+`balance`/`coin` accumulator ops on an allowlisted stablecoin. So **any object
+write — and even any custom `moveCall` that writes nothing — disqualifies the whole
+transaction.** You can't smuggle a state change into a gasless tx.
+
+The move is to **maneuver, not smuggle**: keep the value-movement legs pure, and
+push object creation *out* of the user's transaction.
+
+- **Fan-out stays free.** Multiple `send_funds` in one PTB is still only accumulator
+  ops → **one-to-many disbursement is gasless**: payroll, revenue splits, marketplace
+  payouts, allowlisted-stablecoin airdrops — all in a single free transaction.
+- **Deposit-and-settle.** Instead of the user calling your contract (mutates a
+  shared object → gas), the user does a **gasless `send_funds` into your app's
+  address balance**, and your app performs the object-writing settlement **later, in
+  bulk, on its own dime**. The user's action is free; the state change is amortized.
+- **Native + sponsored split.** When an object write must happen *for* the user
+  (mint a receipt, open a position), split into two txns: **transfer leg
+  native-gasless, object leg sponsored** (Technique 2). The user pays nothing
+  end-to-end; only the object leg costs you.
+- **Balances-first data model.** Represent state as address balances where possible;
+  mint receipts/NFTs lazily or batched, not per-transfer.
+
+**Mental model:** you can't make an object-writing *transaction* free — but you can
+make the user's *experience* free by keeping money movement as pure accumulator ops
+and deferring / batching / sponsoring the object legs. The constraint pushes you
+toward good payment-systems design: separate the **money rail** (free, fast,
+high-frequency) from the **ledger/state updates** (batched, settled, low-frequency).
+
 ## Reference implementation (mainnet)
 
 ```ts
