@@ -30,6 +30,7 @@ to run*. Anything else you want gasless → *sponsor it*. See `ARCHITECTURE.md` 
 | `move/` | **FUSD** — a test stablecoin (`fusd`) with an open faucet + a `pay` MoveCall so the station can strictly allowlist it. |
 | `scripts/` | `mainnet-gasless-proof.mjs` (walks a real **native** mainnet gasless USDC tx), `gasless-e2e.mjs` (self-contained sponsored proof), `verify-app-endpoint.mjs` (drives the app's live `/api/sponsor`). |
 | `docs/gasless-explained.md` | Teaching reference — **both** techniques end to end (native Address Balances + sponsored). |
+| `docs/native-gasless-architecture.md` | **How to build native gasless on mainnet** — the client-only blueprint: gRPC transport, eligibility pre-flight, stateless build, single signature, and the mandatory fallback. |
 | `ARCHITECTURE.md` | Both architectures + when to use which + how sponsoring composes with Day 1/Day 3. |
 
 > **Note on the demo:** the runnable app demonstrates **sponsored** transactions
